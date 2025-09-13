@@ -23,6 +23,10 @@ export class AlertsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.server.to(`station_${stationId}`).emit('tourist_update', tourist);
   }
 
+  sendPanicAlertToPolice(stationId: number, alert: any) {
+    this.server.to(`station_${stationId}`).emit('panic-alert', alert);
+  }
+
   // 📍 broadcast tourist removal (e.g., when out of range or inactive)
   sendTouristRemoval(stationId: number, touristId: string) {
     this.server.to(`station_${stationId}`).emit('tourist_removed', { touristId });
@@ -31,7 +35,7 @@ export class AlertsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // 🛠️ when a police client connects, put them into their "station room"
   handleConnection(client: Socket) {
     const stationId = client.handshake.query.stationId;
-    if (stationId) {
+    if (stationId && !isNaN(Number(stationId))) {
       const idNum = Number(stationId);
       client.join(`station_${idNum}`);
 
@@ -50,7 +54,6 @@ export class AlertsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         clients.delete(client.id);
         console.log(`Police station ${stationId} disconnected (client: ${client.id})`);
 
-        // cleanup room if empty
         if (clients.size === 0) {
           this.activeStations.delete(stationId);
         }

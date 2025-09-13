@@ -1,13 +1,13 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Location } from './location.entity';
-import { Repository } from 'typeorm';
+import { Not, IsNull, Repository } from 'typeorm';
 import { Tourist } from '../tourists/tourist.entity';
 import { RiskZone } from '../risk-zones/risk-zone.entity';
 import { AlertsService } from '../alerts/alerts.service';
 import { AlertsGateway } from '../alerts/alerts.gateway';
-import { getDistance } from '../shared/geo-utils';
 import { PoliceStation } from 'src/police-stations/police-station.entity';
+import { Point } from 'geojson';
 
 @Injectable()
 export class LocationsService {
@@ -26,47 +26,44 @@ export class LocationsService {
   ) {}
 
   /**
-   * Handle possible police alert escalation
+   * OPTIMIZED: Notifies all stations covering a tourist's location without loading every station from the DB.
    */
   private async maybeCreatePoliceAlert(
-  tourist: Tourist,
-  zone: RiskZone,
-  dist: number,
-  currentLat: number,
-  currentLng: number,
-) {
-  const key = `${tourist.touristId}_${zone.id}`;
-  const now = Date.now();
-  if (
-    this.policeAlertCooldown[key] &&
-    now - this.policeAlertCooldown[key] < this.POLICE_COOLDOWN_MS
+    tourist: Tourist,
+    zone: RiskZone,
+    dist: number,
+    currentLat: number,
+    currentLng: number,
   ) {
-    return null;
-  }
+    const key = `${tourist.touristId}_${zone.id}`;
+    const now = Date.now();
+    if (
+      this.policeAlertCooldown[key] &&
+      now - this.policeAlertCooldown[key] < this.POLICE_COOLDOWN_MS
+    ) {
+      return null;
+    }
 
-  let severity: string | undefined;
-  if (dist <= 500) severity = 'CRITICAL_500';
-  else if (dist <= 700) severity = 'CRITICAL_700';
+    let severity: string | undefined;
+    if (dist <= 500) severity = 'CRITICAL_500';
+    else if (dist <= 700) severity = 'CRITICAL_700';
 
-  if (severity) {
-    // ✅ use tourist entity directly
-    const alert = await this.alertsSvc.createAlert(
-      tourist,
-      zone.name,
-      severity,
-      Math.round(dist),
-    );
-
-    this.policeAlertCooldown[key] = now;
-
-    // notify stations covering current location
-    const stations = await this.stationRepo.find();
-    for (const station of stations) {
-      const d = getDistance(
-        { lat: currentLat, lng: currentLng },
-        { lat: station.lat, lng: station.lng },
+    if (severity) {
+      // ✅ createAlert will correctly find the single nearest station for assignment
+      const alert = await this.alertsSvc.createAlert(
+        tourist,
+        zone.name,
+        severity,
+        Math.round(dist),
       );
-      if (d <= station.jurisdictionRadius) {
+
+      this.policeAlertCooldown[key] = now;
+
+      // OPTIMIZED: Fetch ONLY the stations that have jurisdiction over the tourist's current location.
+      const coveringStations = await this.findStationsCoveringPoint(currentLng, currentLat);
+
+      // Notify each of these relevant stations via WebSocket
+      for (const station of coveringStations) {
         this.alertsGateway.sendToPolice(station.id, {
           id: alert.id,
           touristId: tourist.touristId,
@@ -77,12 +74,11 @@ export class LocationsService {
           createdAt: alert.createdAt,
         });
       }
-    }
 
-    return alert;
+      return alert;
+    }
+    return null;
   }
-  return null;
-}
 
   /**
    * Main entrypoint: handle tourist location update
@@ -97,73 +93,58 @@ export class LocationsService {
     if (!touristId || typeof lat !== 'number' || typeof lng !== 'number')
       return { ok: false, error: 'Invalid payload' };
 
-    // ensure tourist exists
     let tourist = await this.touristRepo.findOneBy({ touristId });
     if (!tourist) {
       tourist = this.touristRepo.create({ touristId, name: touristId });
-      await this.touristRepo.save(tourist);
     }
 
-    // save location
+    // UPDATED: Use GeoJSON Point for location fields
+    const currentLocation: Point = { type: 'Point', coordinates: [lng, lat] };
+
+    // Save location history (assuming Location entity is also updated for PostGIS)
     const loc = this.locRepo.create({
       tourist,
-      lat,
-      lng,
+      location: currentLocation,
       timestamp: timestamp ? new Date(timestamp) : new Date(),
     });
     await this.locRepo.save(loc);
 
-    // update tourist last known
-    tourist.lat = lat;
-    tourist.lng = lng;
+    // Update tourist's last known position
+    tourist.location = currentLocation;
     tourist.lastUpdated = new Date();
     await this.touristRepo.save(tourist);
 
-    // broadcast tourist live position to all stations covering them
-    const stations = await this.stationRepo.find();
-    stations.forEach((station) => {
-      const d = getDistance({ lat, lng }, { lat: station.lat, lng: station.lng });
-      if (d <= station.jurisdictionRadius) {
-        this.alertsGateway.sendToPolice(station.id, {
-          touristId: tourist.touristId,
-          name: tourist.name,
-          lat,
-          lng,
-          lastUpdated: tourist.lastUpdated,
-        });
-      }
+    // OPTIMIZED: Broadcast tourist live position ONLY to stations covering their location.
+    const coveringStations = await this.findStationsCoveringPoint(lng, lat);
+    coveringStations.forEach((station) => {
+      this.alertsGateway.sendToPolice(station.id, {
+        touristId: tourist.touristId,
+        name: tourist.name,
+        lat,
+        lng,
+        lastUpdated: tourist.lastUpdated,
+      });
     });
 
-    // check nearest risk zone
-    const zones = await this.zoneRepo.find();
-    let nearest: (RiskZone & { distance: number }) | null = null;
-    let minDist = Infinity;
-    for (const z of zones) {
-      const d = getDistance({ lat, lng }, { lat: z.lat, lng: z.lng });
-      if (d < minDist) {
-        minDist = d;
-        nearest = { ...z, distance: d };
-      }
-    }
+    // OPTIMIZED: Find the nearest risk zone and its distance in a single DB query.
+    const nearestZone = await this.findNearestRiskZone(lng, lat);
 
-    // tourist alert (entered zone)
     let touristAlert;
-    if (nearest && minDist <= nearest.radius) {
+    if (nearestZone && nearestZone.distance <= nearestZone.radius) {
       touristAlert = {
         touristId,
-        zoneName: nearest.name,
-        distanceMeters: Math.round(minDist),
+        zoneName: nearestZone.name,
+        distanceMeters: Math.round(nearestZone.distance),
         level: 'WARNING',
       };
     }
 
-    // police escalation
     let policeAlert;
-    if (nearest) {
+    if (nearestZone) {
       const created = await this.maybeCreatePoliceAlert(
         tourist,
-        nearest,
-        minDist,
+        nearestZone,
+        nearestZone.distance,
         lat,
         lng,
       );
@@ -174,12 +155,12 @@ export class LocationsService {
       ok: true,
       touristId,
       location: { lat, lng, timestamp: timestamp || new Date().toISOString() },
-      nearestZone: nearest
+      nearestZone: nearestZone
         ? {
-            id: nearest.id,
-            name: nearest.name,
-            distanceMeters: Math.round(minDist),
-            radius: nearest.radius,
+            id: nearestZone.id,
+            name: nearestZone.name,
+            distanceMeters: Math.round(nearestZone.distance),
+            radius: nearestZone.radius,
           }
         : null,
       touristAlert,
@@ -193,13 +174,63 @@ export class LocationsService {
    * Return latest tourist positions for global map
    */
   async getLatestTouristPositions() {
-    const tourists = await this.touristRepo.find();
+    // Note: For large numbers of tourists, pagination should be added here.
+    const tourists = await this.touristRepo.find({ where: { location: Not(IsNull()) } });
     return tourists.map((t) => ({
       touristId: t.touristId,
       name: t.name,
-      lat: t.lat,
-      lng: t.lng,
+      lat: t.location.coordinates[1], // UPDATED: Extract lat/lng from Point
+      lng: t.location.coordinates[0],
       lastUpdated: t.lastUpdated,
     }));
   }
+
+  // --- Helper Methods using PostGIS ---
+
+  /**
+   * Finds all police stations whose jurisdiction covers a given point.
+   */
+  private findStationsCoveringPoint(lng: number, lat: number): Promise<PoliceStation[]> {
+    return this.stationRepo
+      .createQueryBuilder('station')
+      .where(
+        `ST_DWithin(
+          station.location,
+          ST_MakePoint(:lng, :lat)::geography,
+          station."jurisdictionRadius"
+        )`, // --- FIXED: Quoted the column name to preserve case
+        { lng, lat },
+      )
+      .getMany();
+  }
+
+  /**
+   * Finds the single nearest risk zone to a point and returns it along with its distance.
+   * Assumes the RiskZone entity also has a 'location: Point' and 'radius: number' field.
+   */
+  private async findNearestRiskZone(lng: number, lat: number): Promise<(RiskZone & { distance: number }) | null> {
+    const query = this.zoneRepo
+      .createQueryBuilder('zone')
+      .select('zone')
+      // Use ST_Distance to calculate the distance directly in the database
+      .addSelect(
+        'ST_Distance(zone.location, ST_MakePoint(:lng, :lat)::geography)',
+        'distance',
+      )
+      .setParameters({ lng, lat })
+      .orderBy('distance', 'ASC') // Order by the calculated distance
+      .limit(1); // We only need the closest one
+
+    const result = await query.getRawAndEntities();
+
+    if (!result.entities[0]) {
+      return null;
+    }
+
+    return {
+      ...result.entities[0],
+      distance: Math.round(result.raw[0].distance),
+    };
+  }
 }
+

@@ -6,6 +6,7 @@ import { AlertsModule } from './alerts/alerts.module';
 import { DatabaseModule } from './database/database.module';
 import { RiskZonesModule } from './risk-zones/risk-zone.module';
 import { PoliceStationsModule } from './police-stations/police-station.module';
+import { PanicModule } from './panic/panic.module';
 
 @Module({
   imports: [
@@ -15,7 +16,8 @@ import { PoliceStationsModule } from './police-stations/police-station.module';
     AlertsModule,
     DatabaseModule,
     RiskZonesModule,
-    PoliceStationsModule
+    PoliceStationsModule,
+    PanicModule
   ],
-})
+})  
 export class AppModule {}

@@ -1,4 +1,5 @@
 import { Entity, PrimaryGeneratedColumn, Column } from 'typeorm';
+import type { Point } from 'geojson';
 
 @Entity('risk_zones')
 export class RiskZone {
@@ -8,12 +9,27 @@ export class RiskZone {
   @Column()
   name: string;
 
-  @Column('double precision')
-  lat: number;
+  /**
+   * UPDATED: The location of the zone's center is now stored
+   * in a single, spatially-indexed 'location' column.
+   */
+  @Column({
+    type: 'geography',
+    spatialFeatureType: 'Point',
+    srid: 4326, // WGS 84 GPS coordinate system
+  })
+  location: Point;
 
-  @Column('double precision')
-  lng: number;
+  /**
+   * The radius of the risk zone in meters.
+   */
+  @Column('int')
+  radius: number; // in meters
 
-  @Column('int', { default: 1000 })
-  radius: number; // meters
+  // --- The old lat and lng columns are now removed ---
+  // @Column('double precision')
+  // lat: number;
+  //
+  // @Column('double precision')
+  // lng: number;
 }

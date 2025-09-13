@@ -4,7 +4,6 @@ import { Repository } from 'typeorm';
 import { Alert } from './alerts.entity';
 import { PoliceStation } from 'src/police-stations/police-station.entity';
 import { Tourist } from '../tourists/tourist.entity';
-import { getDistance } from '../shared/geo-utils';
 
 @Injectable()
 export class AlertsService {
@@ -28,58 +27,67 @@ export class AlertsService {
     if (typeof touristOrId === 'string') {
       tourist = await this.touristRepo.findOneBy({ touristId: touristOrId });
       if (!tourist) {
-        throw new NotFoundException('Tourist not found');
+        throw new NotFoundException(`Tourist with ID "${touristOrId}" not found`);
       }
     } else {
       tourist = touristOrId;
     }
 
+    // This now uses the new, efficient PostGIS-based method
     const station = await this.findStationForTourist(tourist);
     if (!station) {
-      throw new NotFoundException('No police station covers this tourist');
+      throw new NotFoundException('No police station found covering this tourist\'s location');
     }
 
+    // UPDATED: Assigns the full entity for a proper relation
     const entry = this.repo.create({
       tourist,
       zoneName,
       severity,
       distanceMeters,
-      stationId: station.id, // make sure entity has this
+      policeStation: station,
     });
 
     return this.repo.save(entry);
   }
 
   /**
-   * Find nearest police station that covers a tourist.
+   * OPTIMIZED: Finds the single nearest police station covering a tourist's location using a direct PostGIS query.
    */
   private async findStationForTourist(tourist: Tourist): Promise<PoliceStation | null> {
-    if (tourist.lat === undefined || tourist.lng === undefined) {
+    // Check for the new PostGIS location property
+    if (!tourist.location?.coordinates) {
       return null;
     }
 
-    const stations = await this.stationRepo.find();
-    let nearest: PoliceStation | null = null;
-    let minDist = Infinity;
+    const [lng, lat] = tourist.location.coordinates;
 
-    for (const station of stations) {
-      const d = getDistance(
-        { lat: tourist.lat, lng: tourist.lng },
-        { lat: station.lat, lng: station.lng },
-      );
-      if (d <= station.jurisdictionRadius && d < minDist) {
-        nearest = station;
-        minDist = d;
-      }
-    }
+    // This single query finds all stations covering the point, sorts them by distance, and returns the closest one.
+    const nearestStation = await this.stationRepo
+      .createQueryBuilder('station')
+      // Add a calculated 'distance' field to the selection
+      .addSelect('ST_Distance(station.location, ST_MakePoint(:lng, :lat)::geography)', 'distance')
+      // The WHERE clause filters to only include stations whose jurisdiction covers the tourist
+      .where(
+        `ST_DWithin(
+          station.location,
+          ST_MakePoint(:lng, :lat)::geography,
+          station.jurisdictionRadius
+        )`,
+      )
+      .setParameters({ lng, lat })
+      // Order by the calculated distance to ensure the closest is first
+      .orderBy('distance', 'ASC')
+      .getOne(); // We only need the single closest station
 
-    return nearest;
+    return nearestStation;
   }
 
   findAll() {
     return this.repo.find({
       order: { createdAt: 'DESC' },
-      relations: ['tourist', 'station'], // ensure joined
+      // UPDATED: Assumes the relation in Alert entity is named 'policeStation'
+      relations: ['tourist', 'policeStation'],
     });
   }
 }
